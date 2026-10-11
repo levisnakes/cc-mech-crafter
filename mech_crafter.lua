@@ -18,6 +18,7 @@ STATION_ADDRESS = "MechCrafter"     -- address ingredient orders are sent to
 
 MAX_SETS_PER_ORDER = 8              -- crafts' worth of ingredients per order
 MAX_OPEN_ORDERS = 2                 -- per recipe
+MAX_QUEUED_SETS = 16                -- per recipe: ordered + waiting in the chest, not yet crafted
 ORDER_TIMEOUT_MINUTES = 5           -- give up on an order that hasn't fully arrived
 CRAFT_TIMEOUT_SECONDS = 30          -- craft must finish within this
 
@@ -403,12 +404,19 @@ end
 
 local lastOrderAt = {}
 
+local function inputFreeSlots()
+  local okS, size = call(P.input, "size")
+  local _, slots = contents(P.input)
+  if not okS or not size or not slots then return 0 end
+  return size - #slots
+end
+
 local function orderIngredients(name, r)
   local want, g = wantedSets(name, r)
   local ledgerSets = setsIn(ledgerOf(name), recipeNeed(r))
   local active = (state.active and state.active.recipe == name) and 1 or 0
   local pipeline = openSets(name) + ledgerSets + active
-  local sets = math.min(want - pipeline, MAX_SETS_PER_ORDER)
+  local sets = math.min(want - pipeline, MAX_SETS_PER_ORDER, MAX_QUEUED_SETS - pipeline)
 
   if want == 0 then
     if g then
@@ -421,7 +429,11 @@ local function orderIngredients(name, r)
     return
   end
   if sets <= 0 then
-    setStatus(name, "Working", colors.yellow)
+    if pipeline >= MAX_QUEUED_SETS then
+      setStatus(name, "Working (" .. pipeline .. " queued, max " .. MAX_QUEUED_SETS .. ")", colors.yellow)
+    else
+      setStatus(name, "Working", colors.yellow)
+    end
     return
   end
   if openOrderCount(name) >= MAX_OPEN_ORDERS then
@@ -449,6 +461,19 @@ local function orderIngredients(name, r)
     return
   end
   sets = math.min(sets, possible)
+
+  -- Only order what will fit in the input chest, keeping two slots spare.
+  local free = inputFreeSlots()
+  while sets > 0 do
+    local slotsNeeded = 0
+    for _, n in pairs(need) do slotsNeeded = slotsNeeded + math.ceil(n * sets / 64) end
+    if slotsNeeded <= free - 2 then break end
+    sets = sets - 1
+  end
+  if sets <= 0 then
+    setStatus(name, "Input chest full", colors.orange)
+    return
+  end
 
   local filters, total = {}, 0
   for id, n in pairs(need) do
