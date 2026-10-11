@@ -2,14 +2,13 @@
 --
 -- When a Factory Controller gauge for one of your recipes is below its target,
 -- this orders the ingredients through a Stock Ticker, fills the crafters in the
--- recipe's pattern, pulses PULSE_SIDE to start the craft, waits for the result
--- and moves it into STORAGE. Gauge data comes from the Factory Monitor
--- computer over rednet.
+-- recipe's pattern and pulses PULSE_SIDE to start the craft. The crafters'
+-- output goes wherever your build sends it. Gauge data comes from the Factory
+-- Monitor computer over rednet.
 
 -- Peripheral names: right-click a block's wired modem to see its name.
 INPUT_CHEST = "minecraft:chest_0"   -- ingredient packages unpack into this
-OUTPUT_CHEST = "minecraft:chest_1"  -- the last crafter outputs into this
-STORAGE = "create:item_vault_0"     -- finished items go here (needs a Stock Link)
+STORAGE = nil                       -- optional: where "Return them" sends unordered items
 CRAFTERS = nil                      -- nil = find the connected crafter grid
 STOCK_TICKER = nil                  -- nil = find it
 PACKAGER = nil                      -- optional, only used for the package log
@@ -128,7 +127,6 @@ end
 
 local function resolve()
   P.input = INPUT_CHEST
-  P.output = OUTPUT_CHEST
   P.storage = STORAGE
   P.crafter = CRAFTERS or findCrafter()
   P.ticker = STOCK_TICKER
@@ -151,8 +149,6 @@ local function resolve()
     return true
   end
   need(P.input, "Input chest")
-  need(P.output, "Output chest")
-  need(P.storage, "Storage")
   need(P.crafter, "Crafters")
   need(P.ticker, "Stock Ticker")
   P.size = 0
@@ -500,35 +496,25 @@ local function clearCrafters()
   return totals ~= nil and next(totals) == nil
 end
 
-local function moveOutputToStorage()
-  local _, slots = contents(P.output)
-  if not slots then return 0 end
-  local moved = 0
-  for _, s in ipairs(slots) do
-    local ok, n = call(P.output, "pushItems", P.storage, s.slot)
-    if ok and n then moved = moved + n end
-  end
-  return moved
-end
-
-local function finishCraft(name, produced)
+local function finishCraft(name)
   local r = recipes[name]
-  local a = state.active
+  local makes = r and r.makes or 1
   state.active = nil
   state.made[name] = (state.made[name] or 0) + 1
   if (state.manual[name] or 0) > 0 then state.manual[name] = state.manual[name] - 1 end
-  table.insert(state.recent, { t = now(), recipe = name, items = produced })
-  if r and a and produced ~= r.makes and produced > 0 then
-    log("info", name .. " makes " .. produced .. ", updated recipe")
-    r.makes = produced
-    saveRecipes()
-  end
+  table.insert(state.recent, { t = now(), recipe = name, items = makes })
   local guard = state.guard[name] or { crafted = 0 }
-  guard.crafted = guard.crafted + produced
+  guard.crafted = guard.crafted + makes
   state.guard[name] = guard
   saveState()
-  moveOutputToStorage()
   dirty = true
+end
+
+local function giveBack(name, need)
+  local ledger = ledgerOf(name)
+  for id, n in pairs(need) do ledger[id] = (ledger[id] or 0) + n end
+  state.active = nil
+  saveState()
 end
 
 -- A craft was running when the computer stopped or errored. Work out what happened.
@@ -536,23 +522,31 @@ local function recoverActive()
   local a = state.active
   if not a then return end
   local name = a.recipe
-  local out = contents(P.output) or {}
-  local made = (out[a.output] or 0) - (a.snap or 0)
-  if made > 0 then
+  local crafterItems = contents(P.crafter)
+  if not crafterItems then return end
+  if a.filled and next(crafterItems) == nil then
     log("info", "Recovered finished " .. name .. " craft")
-    finishCraft(name, made)
+    finishCraft(name)
     return
   end
-  local crafterItems = contents(P.crafter) or {}
-  local ledger = ledgerOf(name)
   if next(crafterItems) ~= nil then clearCrafters() end
-  for id, n in pairs(a.need) do ledger[id] = (ledger[id] or 0) + n end
-  state.active = nil
-  saveState()
+  giveBack(name, a.need)
   log("warn", "Interrupted " .. name .. " craft, ingredients returned")
 end
 
 local failStreak = {}
+
+-- Crafters only accept items while idle, so a refused item means the last
+-- craft is still running. Keep offering the first item until one goes in.
+local function waitForIdle(step)
+  local start = now()
+  while now() - start < CRAFT_TIMEOUT_SECONDS do
+    local ok, n = call(P.input, "pushItems", P.crafter, step.from, 1, step.to)
+    if ok and n == 1 then return true end
+    sleep(0.5)
+  end
+  return false
+end
 
 local function craftOnce(name, r)
   local need = recipeNeed(r)
@@ -602,79 +596,65 @@ local function craftOnce(name, r)
   -- Claim the ingredients before moving anything so a crash can't lose them.
   local ledger = ledgerOf(name)
   for id, n in pairs(need) do ledger[id] = (ledger[id] or 0) - n end
-  local out = contents(P.output) or {}
-  state.active = { recipe = name, need = need, output = r.output, snap = out[r.output] or 0, at = now() }
+  state.active = { recipe = name, need = need, at = now(), filled = false }
   saveState()
   activity = "Crafting " .. name
   dirty = true
 
-  -- Fill every crafter in the same tick.
+  if not waitForIdle(plan[1]) then
+    clearCrafters()
+    giveBack(name, need)
+    pauseRecipe(name, "Crafters stayed busy. Is their output blocked?")
+    return false
+  end
+
+  -- Fill the rest in the same tick.
   local failed = 0
   local tasks = {}
-  for _, step in ipairs(plan) do
+  for i = 2, #plan do
+    local step = plan[i]
     tasks[#tasks + 1] = function()
       local ok, n = call(P.input, "pushItems", P.crafter, step.from, 1, step.to)
       if not ok or n ~= 1 then failed = failed + 1 end
     end
   end
-  parallel.waitForAll(table.unpack(tasks))
+  if #tasks > 0 then parallel.waitForAll(table.unpack(tasks)) end
 
   if failed > 0 then
     clearCrafters()
-    for id, n in pairs(need) do ledger[id] = ledger[id] + n end
-    state.active = nil
-    saveState()
+    giveBack(name, need)
     failStreak[name] = (failStreak[name] or 0) + 1
     log("warn", name .. ": " .. failed .. " crafter(s) refused an item")
     if failStreak[name] >= 3 then
-      pauseRecipe(name, "Crafters keep refusing items (slot covers? not idle?)")
+      pauseRecipe(name, "Crafters keep refusing items (slot covers?)")
     end
     return false
   end
+  state.active.filled = true
+  saveState()
 
   pulse()
 
+  -- The crafters empty their slots the moment the craft starts.
   local start = now()
   local repulsed = false
-  while now() - start < CRAFT_TIMEOUT_SECONDS do
-    sleep(0.5)
-    local o = contents(P.output) or {}
-    local made = (o[r.output] or 0) - state.active.snap
-    if made >= r.makes then
-      sleep(0.5)
-      o = contents(P.output) or {}
-      made = (o[r.output] or 0) - state.active.snap
+  while now() - start < 8 do
+    sleep(0.25)
+    local c = contents(P.crafter)
+    if c and next(c) == nil then
       failStreak[name] = 0
-      finishCraft(name, made)
+      finishCraft(name)
       return true
     end
-    -- If the items are still sitting in the crafters, the pulse may not have landed.
     if not repulsed and now() - start > 3 then
-      local c = contents(P.crafter)
-      if c and next(c) ~= nil then pulse() end
+      pulse()
       repulsed = true
     end
   end
 
-  -- Timed out.
-  local o = contents(P.output) or {}
-  local made = (o[r.output] or 0) - state.active.snap
-  if made > 0 then
-    finishCraft(name, made)
-    return true
-  end
-  local c = contents(P.crafter) or {}
-  if next(c) ~= nil then
-    clearCrafters()
-    for id, n in pairs(need) do ledger[id] = ledger[id] + n end
-    state.active = nil
-    saveState()
-    pauseRecipe(name, "Crafters didn't craft. Check rotation and that the pattern is a real recipe")
-  else
-    state.active = nil
-    saveState()
-    pauseRecipe(name, "No output appeared. Check the output crafter faces OUTPUT_CHEST")
-  end
+  clearCrafters()
+  giveBack(name, need)
+  pauseRecipe(name, "Crafters didn't craft. Check rotation and that the pattern is a real recipe")
   return false
 end
 
@@ -690,12 +670,13 @@ local function runawayCheck(name, r)
   end
   local limit = math.max(256, (g.target or 0) * (unitMultiplier(g, r) or 1) * 4)
   if guard.crafted > limit then
-    pauseRecipe(name, "Crafted " .. guard.crafted .. " but gauge stock didn't rise. Is STORAGE linked to the network?")
+    pauseRecipe(name, "Crafted " .. guard.crafted .. " but gauge stock didn't rise. Is the output reaching the network?")
     guard.crafted = 0
   end
 end
 
 local function returnExtras()
+  if not P.storage then return end
   local _, slots = contents(P.input)
   if not slots then return end
   local left = {}
@@ -993,8 +974,12 @@ local function drawStatus()
 
   local extraCount = sum(extras)
   if extraCount > 0 then
-    put(2, H, clip(extraCount .. " unordered items in input chest", W - 18), colors.orange, colors.black)
-    button(W - 15, H, "Return them", colors.orange, function() pendingAction = "return_extras" end)
+    if P.storage then
+      put(2, H, clip(extraCount .. " unordered items in input chest", W - 18), colors.orange, colors.black)
+      button(W - 15, H, "Return them", colors.orange, function() pendingAction = "return_extras" end)
+    else
+      put(2, H, clip(extraCount .. " unordered items in input chest (take them out)", W - 2), colors.orange, colors.black)
+    end
   end
 end
 
@@ -1163,7 +1148,7 @@ end
 local function drawSetup()
   local y = 3
   local rows = {
-    { "Input chest", P.input }, { "Output chest", P.output }, { "Storage", P.storage },
+    { "Input chest", P.input }, { "Storage (optional)", P.storage },
     { "Crafters", P.crafter }, { "Stock Ticker", P.ticker }, { "Packager (log)", P.packager },
   }
   for _, row in ipairs(rows) do

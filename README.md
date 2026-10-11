@@ -5,7 +5,9 @@ ComputerCraft program that runs a 5x5 grid of Create mechanical crafters. When a
 1. orders the ingredients through a Stock Ticker,
 2. fills each crafter in the recipe's pattern,
 3. pulses the crafters to start the craft,
-4. waits for the result and moves it into storage.
+4. waits for the crafters to finish before starting the next one.
+
+The crafted item goes wherever your build sends it from the output crafter.
 
 Gauge data comes from the [Factory Monitor](https://github.com/levisnakes/cc-factory-monitor) computer over rednet.
 
@@ -20,10 +22,10 @@ wget https://raw.githubusercontent.com/levisnakes/cc-mech-crafter/main/mech_craf
 - **Crafters:** a 5x5 wall of mechanical crafters with every input connected using the wrench, so they share one inventory. The arrows must lead to one output crafter.
 - **Computer:** one face of a crafter touches the computer's back (`PULSE_SIDE`).
 - **Input chest:** the station's packager unpacks ingredient packages into it. Packages arrive at the station address (`STATION_ADDRESS`, default `MechCrafter`) through a frogport or postbox that feeds that packager.
-- **Output chest:** sits in front of the output crafter.
-- **Storage:** an inventory that's part of your Create network (it has a Stock Link), so the gauge sees the finished items.
-- **Wired modems** on the input chest, output chest, storage, one crafter, the Stock Ticker and the packager, all on one cable with the computer.
-- The input and output chests must **not** have Stock Links.
+- **Output:** the output crafter sends its item into your network however you like (belt, funnel, packager). The gauge has to see it arrive.
+- **Wired modems** on the input chest, one crafter, the Stock Ticker and the packager, all on one cable with the computer.
+- The input chest must **not** have a Stock Link.
+- `STORAGE` is optional: set it to an inventory on the cable to get a button that sends unordered items out of the input chest.
 
 ## Gauges
 
@@ -33,8 +35,8 @@ On the Factory Controller, add a gauge for each crafted item and set its target.
 
 1. **Setup** tab: check every block is found, then press **Calibrate**. Put any item in the input chest; the computer places it in each crafter in turn and you click where it appeared. **Use reading order** is a shortcut if your slots already follow the grid left-to-right, top-to-bottom.
 2. **Recipes** tab: **New**. Put one of each ingredient in the input chest; they appear on the left. Pick an item, click grid cells to place it, set the name and the output item, then **Save**.
-3. Go back to **Status** and press **Return them** to send the ingredients you used for the editor back to storage.
+3. Take the ingredients you used for the editor back out of the input chest (or press **Return them** if `STORAGE` is set).
 
 **Craft +1** and **+8** queue crafts by hand, whatever the gauge says.
 
-If a craft fails (no rotation, wrong pattern, output not appearing), the recipe pauses, the ingredients go back into the input chest, and the Status tab shows why with a **Resume** button.
+If a craft fails (no rotation, wrong pattern, output blocked), the recipe pauses, the ingredients go back into the input chest, and the Status tab shows why with a **Resume** button.
