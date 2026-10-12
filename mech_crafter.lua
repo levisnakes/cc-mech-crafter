@@ -20,7 +20,10 @@ MAX_SETS_PER_ORDER = 8              -- crafts' worth of ingredients per order
 MAX_OPEN_ORDERS = 2                 -- per recipe
 MAX_QUEUED_SETS = 16                -- per recipe: ordered + waiting in the chest, not yet crafted
 ORDER_TIMEOUT_MINUTES = 5           -- give up on an order that hasn't fully arrived
-CRAFT_TIMEOUT_SECONDS = 30          -- craft must finish within this
+CRAFT_TIMEOUT_SECONDS = 30          -- crafters must be ready for the next craft within this
+REPULSE_SECONDS = 2                 -- pulse again this often while a filled craft hasn't started
+GIVE_UP_SECONDS = 120               -- stop pulsing, return the ingredients and pause after this
+AUTO_UPDATE = true        -- install new versions from GitHub automatically, keeping these settings
 
 
 -- ============================================================ basics
@@ -729,26 +732,32 @@ local function craftOnce(name, r)
 
   pulse()
 
-  -- The crafters empty their slots the moment the craft starts.
+  -- The crafters empty their slots the moment the craft starts. Keep pulsing
+  -- until they do.
   local start = now()
-  local repulsed = false
-  while now() - start < 8 do
+  local lastPulse = now()
+  local pulses = 1
+  while now() - start < GIVE_UP_SECONDS do
     sleep(0.25)
     local c = contents(P.crafter)
     if c and next(c) == nil then
       failStreak[name] = 0
+      if pulses > 1 then log("info", name .. " started after " .. pulses .. " pulses") end
       finishCraft(name)
       return true
     end
-    if not repulsed and now() - start > 3 then
+    if now() - lastPulse >= REPULSE_SECONDS then
       pulse()
-      repulsed = true
+      lastPulse = now()
+      pulses = pulses + 1
+      activity = "Crafting " .. name .. " (pulse " .. pulses .. ")"
+      dirty = true
     end
   end
 
   clearCrafters()
   giveBack(name, need)
-  pauseRecipe(name, "Crafters didn't craft. Check rotation and that the pattern is a real recipe")
+  pauseRecipe(name, "Crafters didn't start after " .. GIVE_UP_SECONDS .. "s of pulsing. Check rotation and the pattern")
   return false
 end
 
@@ -1450,4 +1459,150 @@ end
 if not fs.exists(DIR) then fs.makeDir(DIR) end
 resolve()
 log("info", "Mech Crafter " .. VERSION .. " started")
-parallel.waitForAny(engineLoop, netLoop, uiLoop)
+local function readyToUpdate()
+  -- never in the middle of a craft or calibration
+  return state.active == nil and not calibrating
+end
+
+-- ============================================================ auto-update
+
+-- Every UPDATE_CHECK_MINUTES this checks GitHub for a newer version. A new
+-- version is downloaded, checked that it loads, given your current settings
+-- (the UPPERCASE lines at the top of this file), saved, and the computer
+-- reboots into it. Set AUTO_UPDATE = false at the top to turn this off.
+local UPDATE_REPO = "levisnakes/cc-mech-crafter"
+local UPDATE_FILE = "mech_crafter.lua"
+local UPDATE_CHECK_MINUTES = 15
+local PROGRAM_PATH = (shell and shell.getRunningProgram()) or "startup.lua"
+local SHA_FILE = "/.version_" .. UPDATE_FILE
+
+-- Settings are the top-of-file assignments to UPPERCASE names, before the
+-- first "local" line or "-- ====" section. Tables can span several lines.
+local function splitSettings(src)
+  local settings, rest = {}, {}
+  local inSettings = true
+  for line in (src .. "\n"):gmatch("(.-)\n") do
+    if inSettings and (line:match("^local ") or line:match("^%-%- ====")) then inSettings = false end
+    table.insert(inSettings and settings or rest, line)
+  end
+  return settings, rest
+end
+
+local function braceDelta(line)
+  local code = line:gsub('"[^"]*"', ""):gsub("%-%-.*$", "")
+  local _, opens = code:gsub("{", "")
+  local _, closes = code:gsub("}", "")
+  return opens - closes
+end
+
+-- [NAME] = the full statement text, possibly several lines
+local function statements(lines)
+  local out = {}
+  local i = 1
+  while i <= #lines do
+    local name = lines[i]:match("^([%u_][%u%d_]*)%s*=")
+    if name then
+      local block = { lines[i] }
+      local depth = braceDelta(lines[i])
+      while depth > 0 and i < #lines do
+        i = i + 1
+        table.insert(block, lines[i])
+        depth = depth + braceDelta(lines[i])
+      end
+      out[name] = table.concat(block, "\n")
+    end
+    i = i + 1
+  end
+  return out
+end
+
+-- New file, with each setting that already exists replaced by your value.
+local function mergeSettings(oldSrc, newSrc)
+  local oldSettings = statements((splitSettings(oldSrc)))
+  local newSettings, rest = splitSettings(newSrc)
+  local out = {}
+  local i = 1
+  while i <= #newSettings do
+    local line = newSettings[i]
+    local name = line:match("^([%u_][%u%d_]*)%s*=")
+    if name and oldSettings[name] then
+      table.insert(out, oldSettings[name])
+      local depth = braceDelta(line)
+      while depth > 0 and i < #newSettings do
+        i = i + 1
+        depth = depth + braceDelta(newSettings[i])
+      end
+    else
+      table.insert(out, line)
+    end
+    i = i + 1
+  end
+  for _, line in ipairs(rest) do table.insert(out, line) end
+  local merged = table.concat(out, "\n")
+  -- splitting added one trailing newline's worth of empty line; match the source
+  if newSrc:sub(-1) == "\n" and merged:sub(-1) ~= "\n" then merged = merged .. "\n" end
+  return (merged:gsub("\n\n$", "\n"))
+end
+
+local function fetch(url, headers)
+  local ok, h = pcall(http.get, url, headers)
+  if not ok or not h then return nil end
+  local body = h.readAll()
+  h.close()
+  return body
+end
+
+local function readText(path)
+  if not fs.exists(path) then return nil end
+  local f = fs.open(path, "r")
+  local t = f.readAll()
+  f.close()
+  return t
+end
+
+local function writeText(path, text)
+  local f = fs.open(path, "w")
+  f.write(text)
+  f.close()
+end
+
+local function checkForUpdate()
+  if AUTO_UPDATE == false or not http then return end
+  local sha = fetch("https://api.github.com/repos/" .. UPDATE_REPO .. "/commits/main",
+    { ["Accept"] = "application/vnd.github.sha", ["User-Agent"] = "cc-auto-update" })
+  if not sha then return end
+  sha = sha:match("^%s*(%x+)%s*$")
+  if not sha or #sha < 40 or readText(SHA_FILE) == sha then return end
+
+  local newSrc = fetch("https://raw.githubusercontent.com/" .. UPDATE_REPO .. "/" .. sha .. "/" .. UPDATE_FILE)
+  if not newSrc or not _G.load(newSrc, UPDATE_FILE) then return end
+  local oldSrc = readText(PROGRAM_PATH)
+  if not oldSrc then return end
+  local merged = mergeSettings(oldSrc, newSrc)
+  if not _G.load(merged, UPDATE_FILE) then return end
+  if merged == oldSrc then
+    writeText(SHA_FILE, sha)
+    return
+  end
+
+  while not readyToUpdate() do sleep(5) end
+  writeText(PROGRAM_PATH .. ".old", oldSrc)
+  writeText(PROGRAM_PATH, merged)
+  writeText(SHA_FILE, sha)
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("Updated to " .. sha:sub(1, 7) .. ", restarting...")
+  sleep(1)
+  os.reboot()
+end
+
+local function updateLoop()
+  sleep(10)
+  while true do
+    pcall(checkForUpdate)
+    sleep(UPDATE_CHECK_MINUTES * 60)
+  end
+end
+
+parallel.waitForAny(engineLoop, netLoop, uiLoop, updateLoop)
