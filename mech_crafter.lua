@@ -264,6 +264,19 @@ end
 -- ============================================================ engine
 
 local recipeStatus = {}  -- [name] = { text, color }
+local recipeMissing = {} -- [name] = { { item, have, need } } while blocked on ingredients
+
+-- Why the network is short of an item, judged from the gauge that makes it.
+local function supplyState(itemId)
+  local g = gaugeFor(itemId)
+  if not factoryFresh() then return "no factory data" end
+  if not g then return "no gauge makes it" end
+  if g.paused or factory.paused then return "its gauge is paused" end
+  if (g.promised or 0) > 0 then return "+" .. g.promised .. " on the way" end
+  if g.waiting then return "its gauge is waiting for inputs" end
+  if g.satisfied then return "gauge target too low" end
+  return "gauge short, not ordered yet"
+end
 local activity = "Starting"
 local calibrating = false
 local pendingAction = nil
@@ -429,6 +442,7 @@ local function inputFreeSlots()
 end
 
 local function orderIngredients(name, r)
+  recipeMissing[name] = nil
   local want, g = wantedSets(name, r)
   local ledgerSets = setsIn(ledgerOf(name), recipeNeed(r))
   local active = (state.active and state.active.recipe == name) and 1 or 0
@@ -499,12 +513,14 @@ local function orderIngredients(name, r)
   while sets > 0 and not fits((request(sets))) do sets = sets - 1 end
   if sets == 0 then
     local req = request(1)
-    local missing = {}
+    local missing, info = {}, {}
     for id, n in pairs(req) do
       if (have[id] or 0) < n then
-        table.insert(missing, pretty(id) .. ": have " .. (have[id] or 0) .. ", need " .. n)
+        table.insert(missing, pretty(id) .. ": have " .. (have[id] or 0) .. ", need " .. n .. " (" .. supplyState(id) .. ")")
+        table.insert(info, { item = id, have = have[id] or 0, need = n })
       end
     end
+    recipeMissing[name] = info
     setStatus(name, "Missing " .. table.concat(missing, "; "), colors.red)
     return
   end
@@ -852,7 +868,7 @@ local function statusMessage()
     table.insert(list, {
       name = name, output = r.output, made = state.made[name] or 0,
       queued = openSets(name) + setsIn(ledgerOf(name), recipeNeed(r)),
-      status = s.text, paused = r.paused or false,
+      status = s.text, paused = r.paused or false, missing = recipeMissing[name],
     })
   end
   return {
