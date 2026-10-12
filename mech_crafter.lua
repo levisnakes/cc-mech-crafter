@@ -345,6 +345,23 @@ local function reconcile()
       end
     end
   end
+  -- Leftovers nobody ordered (late packages, items dropped in by hand) go to
+  -- the first recipe that uses them, so they get crafted instead of sitting there.
+  for _, name in ipairs(sortedRecipeNames()) do
+    local r = recipes[name]
+    if not r.paused then
+      for id in pairs(recipeNeed(r)) do
+        local n = surplus[id] or 0
+        if n > 0 then
+          local ledger = ledgerOf(name)
+          ledger[id] = (ledger[id] or 0) + n
+          surplus[id] = nil
+          changed = true
+          log("info", "Using " .. n .. " leftover " .. pretty(id) .. " for " .. name)
+        end
+      end
+    end
+  end
   extras = surplus
 
   -- Finished or expired orders hand their items to the recipe's ledger.
@@ -451,22 +468,52 @@ local function orderIngredients(name, r)
   for _, s in pairs(stock) do have[s.name] = (have[s.name] or 0) + s.count end
 
   local need = recipeNeed(r)
-  local possible = setsIn(have, need)
-  if possible == 0 then
-    local missing = {}
-    for id, n in pairs(need) do
-      if (have[id] or 0) < n then table.insert(missing, pretty(id)) end
+
+  -- Partial leftovers already in the chest count toward this order, minus
+  -- what earlier open orders are already counting on.
+  local ledger = ledgerOf(name)
+  local leftover = {}
+  for id, n in pairs(need) do
+    leftover[id] = math.max(0, (ledger[id] or 0) - n * ledgerSets)
+  end
+  for _, o in ipairs(state.orders) do
+    if o.recipe == name and o.fromLeftover then
+      for id, n in pairs(o.fromLeftover) do leftover[id] = math.max(0, (leftover[id] or 0) - n) end
     end
-    setStatus(name, "Missing " .. table.concat(missing, ", "), colors.red)
+  end
+  local function request(k)
+    local req, used = {}, {}
+    for id, n in pairs(need) do
+      used[id] = math.min(leftover[id], n * k)
+      req[id] = n * k - used[id]
+    end
+    return req, used
+  end
+  local function fits(req)
+    for id, n in pairs(req) do
+      if (have[id] or 0) < n then return false end
+    end
+    return true
+  end
+
+  while sets > 0 and not fits((request(sets))) do sets = sets - 1 end
+  if sets == 0 then
+    local req = request(1)
+    local missing = {}
+    for id, n in pairs(req) do
+      if (have[id] or 0) < n then
+        table.insert(missing, pretty(id) .. ": have " .. (have[id] or 0) .. ", need " .. n)
+      end
+    end
+    setStatus(name, "Missing " .. table.concat(missing, "; "), colors.red)
     return
   end
-  sets = math.min(sets, possible)
 
   -- Only order what will fit in the input chest, keeping two slots spare.
   local free = inputFreeSlots()
   while sets > 0 do
     local slotsNeeded = 0
-    for _, n in pairs(need) do slotsNeeded = slotsNeeded + math.ceil(n * sets / 64) end
+    for _, n in pairs((request(sets))) do slotsNeeded = slotsNeeded + math.ceil(n / 64) end
     if slotsNeeded <= free - 2 then break end
     sets = sets - 1
   end
@@ -475,11 +522,15 @@ local function orderIngredients(name, r)
     return
   end
 
+  local req, used = request(sets)
   local filters, total = {}, 0
-  for id, n in pairs(need) do
-    table.insert(filters, { name = id, _requestCount = n * sets })
-    total = total + n * sets
+  for id, n in pairs(req) do
+    if n > 0 then
+      table.insert(filters, { name = id, _requestCount = n })
+      total = total + n
+    end
   end
+  if total == 0 then return end
   local okReq, sent = call(P.ticker, "requestFiltered", STATION_ADDRESS, table.unpack(filters))
   lastOrderAt[name] = now()
   if not okReq or not sent or sent == 0 then
@@ -489,10 +540,12 @@ local function orderIngredients(name, r)
   end
 
   local remaining = {}
-  for id, n in pairs(need) do remaining[id] = n * sets end
+  for id, n in pairs(req) do
+    if n > 0 then remaining[id] = n end
+  end
   table.insert(state.orders, {
     id = state.nextOrder, recipe = name, sets = sets,
-    remaining = remaining, got = {}, at = now(),
+    remaining = remaining, got = {}, at = now(), fromLeftover = used,
   })
   state.nextOrder = state.nextOrder + 1
   saveState()
@@ -984,7 +1037,7 @@ local function drawStatus()
     local s = recipeStatus[name] or { text = "", color = colors.white }
     local text = r.paused and ("Paused: " .. (r.error or "")) or s.text
     y = y + 1
-    put(4, y, clip(text, W - 14), r.paused and colors.red or s.color, colors.black)
+    put(4, y, clip(text, r.paused and (W - 14) or (W - 4)), r.paused and colors.red or s.color, colors.black)
     if r.paused then
       button(W - 9, y, "Resume", colors.green, function()
         r.paused, r.error = false, nil
