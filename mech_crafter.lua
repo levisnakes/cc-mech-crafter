@@ -16,6 +16,9 @@ PACKAGER = nil                      -- optional, only used for the package log
 PULSE_SIDE = "back"                 -- side facing a crafter
 STATION_ADDRESS = "MechCrafter"     -- address ingredient orders are sent to
 
+DISCORD_WEBHOOK = nil               -- Discord webhook URL (in quotes) for "stuck" alerts
+DISCORD_MENTION = nil               -- who to ping when stuck, e.g. "<@&ROLE_ID>"
+
 MAX_SETS_PER_ORDER = 8              -- crafts' worth of ingredients per order
 MAX_OPEN_ORDERS = 2                 -- per recipe
 MAX_QUEUED_SETS = 16                -- per recipe: ordered + waiting in the chest, not yet crafted
@@ -392,8 +395,10 @@ local function reconcile()
       table.remove(state.orders, i)
       if complete then
         log("info", "Order #" .. o.id .. " arrived (" .. o.recipe .. " x" .. o.sets .. ")")
+        state.timeoutsInARow = 0
       else
         log("warn", "Order #" .. o.id .. " timed out, " .. sum(o.remaining) .. " items never arrived")
+        state.timeoutsInARow = (state.timeoutsInARow or 0) + 1
       end
       dirty = true
       changed = true
@@ -883,10 +888,132 @@ local function engineLoop()
       local ok, err = pcall(engineTick)
       if not ok then
         log("error", "Engine: " .. tostring(err))
+        engineErrors = engineErrors or {}
+        table.insert(engineErrors, now())
         sleep(2)
       end
     end
     sleep(0.5)
+  end
+end
+
+-- ============================================================ stuck alerts
+
+-- Posts to Discord, with a ping, only when the station is really stuck, and
+-- says what to restart. Each problem is announced once; a follow-up (no ping)
+-- says when it's fixed.
+local watchdog = { queue = {}, open = {}, error = nil }
+engineErrors = {}
+
+local function postDiscord(body)
+  if not DISCORD_WEBHOOK or DISCORD_WEBHOOK == "" or not http then return end
+  table.insert(watchdog.queue, body)
+end
+
+local function alertEmbed(title, what, fix, color, ping)
+  local fields = { { name = "What happened", value = what } }
+  if fix then table.insert(fields, { name = "What to do", value = fix }) end
+  local ok, body = pcall(textutils.serializeJSON, {
+    username = "Mech Crafter",
+    content = (ping and DISCORD_MENTION) or "",
+    allowed_mentions = { parse = { "roles", "users", "everyone" } },
+    embeds = { { title = title, color = color, fields = fields, footer = { text = os.date("!%Y-%m-%d %H:%M UTC") } } },
+  }, { unicode_strings = true })
+  if ok then postDiscord(body) end
+end
+
+-- Open or close a problem. delay = how long it must last before alerting.
+local function problemCheck(key, active, delay, title, what, fix)
+  local p = watchdog.open[key]
+  if active then
+    if not p then
+      p = { since = now(), sent = false }
+      watchdog.open[key] = p
+    end
+    if not p.sent and now() - p.since >= delay then
+      p.sent, p.title = true, title
+      alertEmbed("STUCK: " .. title, what, fix, 15158332, true)
+      log("error", "Alert sent: " .. title)
+    end
+  elseif p then
+    if p.sent then
+      alertEmbed("Fixed: " .. p.title, "The crafting station is running again.", nil, 3066993, false)
+    end
+    watchdog.open[key] = nil
+  end
+end
+
+local function fixFor(err)
+  err = err or ""
+  if err:find("didn't start") then
+    return "Go to the base so it loads, check the crafters have rotation, then press **Resume** on the **crafting computer** (Status tab). If it keeps happening, restart the crafting computer."
+  elseif err:find("stayed busy") then
+    return "Clear whatever is blocking the output crafter, then press **Resume** on the **crafting computer**."
+  elseif err:find("refusing") then
+    return "Check the crafters for slot covers or a broken crafter, then press **Resume** on the **crafting computer**."
+  elseif err:find("calibrated") then
+    return "Run **Setup -> Calibrate** on the **crafting computer**, then press **Resume**."
+  elseif err:find("stock didn't rise") then
+    return "Make sure the crafted items reach network storage the gauge can see, then press **Resume** on the **crafting computer**."
+  end
+  return "Fix the problem above, then press **Resume** on the **crafting computer**."
+end
+
+local function watchdogTick()
+  -- paused recipes alert straight away
+  local pausedNow = {}
+  for name, r in pairs(recipes) do
+    if r.paused then
+      pausedNow[name] = true
+      problemCheck("paused:" .. name, true, 0, name .. " is paused", r.error or "paused", fixFor(r.error))
+    end
+  end
+  for key in pairs(watchdog.open) do
+    local name = key:match("^paused:(.+)$")
+    if name and not pausedNow[name] then problemCheck(key, false) end
+  end
+
+  problemCheck("setup", #problems > 0, 120, "crafting station setup",
+    table.concat(problems, ", "),
+    "Restart the **crafting computer** and check the wired modems on the crafters, Stock Ticker and input chest are red (connected).")
+
+  problemCheck("factory", factory.at > 0 and not factoryFresh(), 120, "no gauge data",
+    "The crafting computer hasn't heard from the Factory Monitor for over 2 minutes, so it can't tell what to craft.",
+    "Restart the **Factory Monitor computer**, and check the cable or modems between the two computers.")
+
+  problemCheck("orders", (state.timeoutsInARow or 0) >= 2, 0, "ingredients never arrive",
+    (state.timeoutsInARow or 0) .. " ingredient orders in a row timed out.",
+    "Check the **" .. STATION_ADDRESS .. "** frogport/postbox and the station packager, and that the chain/train route reaches it. Then restart the **crafting computer**.")
+
+  local recent = 0
+  for i = #engineErrors, 1, -1 do
+    if now() - engineErrors[i] > 300 then table.remove(engineErrors, i) else recent = recent + 1 end
+  end
+  problemCheck("errors", recent >= 3, 0, "program errors",
+    recent .. " errors in the last 5 minutes (see the Log tab).",
+    "Restart the **crafting computer**. If it keeps happening, send the Log tab to whoever looks after the program.")
+end
+
+local function watchdogLoop()
+  local lastTick = 0
+  while true do
+    if now() - lastTick >= 10 then
+      lastTick = now()
+      pcall(watchdogTick)
+    end
+    local body = table.remove(watchdog.queue, 1)
+    if body then
+      local ok, res, err = pcall(http.post, DISCORD_WEBHOOK, body, { ["Content-Type"] = "application/json" })
+      if ok and res then
+        res.close()
+        watchdog.error = nil
+      else
+        watchdog.error = tostring(err or res)
+      end
+      sleep(2)
+    else
+      sleep(1)
+    end
   end
 end
 
@@ -1296,6 +1423,8 @@ local function drawSetup()
   for _ in pairs(calibration) do mapped = mapped + 1 end
   put(2, y + 1, "Crafter slots: " .. (P.size or 0) .. ", calibrated: " .. mapped, colors.white, colors.black)
   put(2, y + 2, "Address: " .. STATION_ADDRESS .. "   Pulse side: " .. PULSE_SIDE, colors.lightGray, colors.black)
+  local alertState = DISCORD_WEBHOOK and (watchdog.error and ("Discord error: " .. watchdog.error) or "Stuck alerts: on") or "Stuck alerts: off (set DISCORD_WEBHOOK)"
+  put(2, y + 3, clip(alertState, W - 2), watchdog.error and colors.orange or colors.lightGray, colors.black)
   local x = 2
   x = button(x, H - 1, "Calibrate", colors.blue, function()
     cal = { slot = 1, size = P.size or 0, step = "start" }
@@ -1648,4 +1777,4 @@ local function bootUpdate()
 end
 
 bootUpdate()
-parallel.waitForAny(engineLoop, netLoop, uiLoop, updateLoop)
+parallel.waitForAny(engineLoop, netLoop, uiLoop, watchdogLoop, updateLoop)

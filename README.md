@@ -40,3 +40,13 @@ On the Factory Controller, add a gauge for each crafted item and set its target.
 **Craft +1** and **+8** queue crafts by hand, whatever the gauge says.
 
 If a craft doesn't start (most often because the base was unloaded mid-craft), it pulses again, up to `RETRY_PULSES` (3) more times, `RETRY_SECONDS` (20) apart; the same goes for crafters that stay busy. After a restart with ingredients still in the crafters, it resumes by pulsing instead of starting over. Only if every retry fails does the recipe pause, with the ingredients back in the input chest and a **Resume** button on the Status tab.
+
+## Stuck alerts
+
+Set `DISCORD_WEBHOOK` (and `DISCORD_MENTION`, e.g. `"<@&ROLE_ID>"`) at the top of the file to get a Discord ping only when something is really stuck, with what to restart or fix. Each problem is posted once, and a follow-up without a ping says when it's fixed.
+
+- a recipe paused after all retries (reload the base / check rotation / press Resume)
+- crafters, Stock Ticker or input chest missing for 2+ minutes (restart the crafting computer, check modems)
+- no gauge data from the Factory Monitor for 2+ minutes (restart the Factory Monitor computer)
+- 2 ingredient orders in a row never arrived (check the station frogport/packager)
+- repeated program errors (restart the crafting computer)
