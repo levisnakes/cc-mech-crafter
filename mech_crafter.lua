@@ -13,7 +13,7 @@ CRAFTERS = nil                      -- nil = find the connected crafter grid
 STOCK_TICKER = nil                  -- nil = find it
 PACKAGER = nil                      -- optional, only used for the package log
 
-PULSE_SIDE = "back"                 -- side facing a crafter
+PULSE_SIDE = "back"                 -- side facing a crafter; every Redstone Relay found is pulsed on all sides too
 STATION_ADDRESS = "MechCrafter"     -- address ingredient orders are sent to
 
 DISCORD_WEBHOOK = nil               -- Discord webhook URL (in quotes) for "stuck" alerts
@@ -598,10 +598,29 @@ local function orderIngredients(name, r)
   setStatus(name, "Ordered", colors.yellow)
 end
 
+-- Redstone Relays on the computer or its cable (found fresh each time).
+local function relays()
+  local out = {}
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.hasType(name, "redstone_relay") then table.insert(out, name) end
+  end
+  return out
+end
+
+-- Pulse PULSE_SIDE and every side of every Redstone Relay at once.
+local function setPulse(on)
+  rs.setOutput(PULSE_SIDE, on)
+  for _, name in ipairs(relays()) do
+    for _, side in ipairs(rs.getSides()) do
+      pcall(peripheral.call, name, "setOutput", side, on)
+    end
+  end
+end
+
 local function pulse()
-  rs.setOutput(PULSE_SIDE, true)
-  sleep(0.15)
-  rs.setOutput(PULSE_SIDE, false)
+  setPulse(true)
+  sleep(0.25)
+  setPulse(false)
 end
 
 -- Put everything in the crafters back into the input chest.
@@ -1439,7 +1458,9 @@ local function drawSetup()
   local mapped = 0
   for _ in pairs(calibration) do mapped = mapped + 1 end
   put(2, y + 1, "Crafter slots: " .. (P.size or 0) .. ", calibrated: " .. mapped, colors.white, colors.black)
-  put(2, y + 2, "Address: " .. STATION_ADDRESS .. "   Pulse side: " .. PULSE_SIDE, colors.lightGray, colors.black)
+  local nRelays = #relays()
+  put(2, y + 2, "Address: " .. STATION_ADDRESS, colors.lightGray, colors.black)
+  put(2, y + 4, "Pulse: " .. PULSE_SIDE .. (nRelays > 0 and (" + " .. nRelays .. " relay" .. (nRelays > 1 and "s" or "") .. " (all sides)") or " (no relay found)"), nRelays > 0 and colors.lime or colors.lightGray, colors.black)
   local alertState = DISCORD_WEBHOOK and (watchdog.error and ("Discord error: " .. watchdog.error) or "Stuck alerts: on") or "Stuck alerts: off (set DISCORD_WEBHOOK)"
   put(2, y + 3, clip(alertState, W - 2), watchdog.error and colors.orange or colors.lightGray, colors.black)
   local x = 2

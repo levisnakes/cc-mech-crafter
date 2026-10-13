@@ -20,7 +20,7 @@ wget https://raw.githubusercontent.com/levisnakes/cc-mech-crafter/main/mech_craf
 ## Build
 
 - **Crafters:** a 5x5 wall of mechanical crafters with every input connected using the wrench, so they share one inventory. The arrows must lead to one output crafter.
-- **Computer:** one face of a crafter touches the computer's back (`PULSE_SIDE`).
+- **Pulse:** one face of a crafter touches the computer's back (`PULSE_SIDE`), or put a **Redstone Relay** next to the crafters on the computer's cable: every relay found is pulsed on all 6 sides.
 - **Input chest:** the station's packager unpacks ingredient packages into it. Packages arrive at the station address (`STATION_ADDRESS`, default `MechCrafter`) through a frogport or postbox that feeds that packager.
 - **Output:** the output crafter sends its item into your network however you like (belt, funnel, packager). The gauge has to see it arrive.
 - **Wired modems** on the input chest, one crafter, the Stock Ticker and the packager, all on one cable with the computer.
