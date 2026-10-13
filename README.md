@@ -39,4 +39,4 @@ On the Factory Controller, add a gauge for each crafted item and set its target.
 
 **Craft +1** and **+8** queue crafts by hand, whatever the gauge says.
 
-If a craft fails (no rotation, wrong pattern, output blocked), the recipe pauses, the ingredients go back into the input chest, and the Status tab shows why with a **Resume** button.
+If a craft doesn't start (most often because the base was unloaded mid-craft), it pulses again, up to `RETRY_PULSES` (3) more times, `RETRY_SECONDS` (20) apart; the same goes for crafters that stay busy. After a restart with ingredients still in the crafters, it resumes by pulsing instead of starting over. Only if every retry fails does the recipe pause, with the ingredients back in the input chest and a **Resume** button on the Status tab.

@@ -21,8 +21,8 @@ MAX_OPEN_ORDERS = 2                 -- per recipe
 MAX_QUEUED_SETS = 16                -- per recipe: ordered + waiting in the chest, not yet crafted
 ORDER_TIMEOUT_MINUTES = 5           -- give up on an order that hasn't fully arrived
 CRAFT_TIMEOUT_SECONDS = 30          -- crafters must be ready for the next craft within this
-REPULSE_SECONDS = 2                 -- pulse again this often while a filled craft hasn't started
-GIVE_UP_SECONDS = 120               -- stop pulsing, return the ingredients and pause after this
+RETRY_PULSES = 3                    -- if a craft doesn't start (e.g. the base unloaded), pulse again this many times
+RETRY_SECONDS = 20                  -- seconds between those retries
 AUTO_UPDATE = true        -- install new versions from GitHub automatically, keeping these settings
 
 
@@ -614,6 +614,30 @@ local function giveBack(name, need)
   saveState()
 end
 
+-- After a pulse the crafters empty their slots the moment the craft starts.
+-- If they don't (usually because the base was unloaded mid-craft), pulse
+-- again, up to RETRY_PULSES more times, RETRY_SECONDS apart.
+local function waitForStart(name)
+  local tries = 0
+  while true do
+    local start = now()
+    while now() - start < (tries == 0 and 5 or RETRY_SECONDS) do
+      sleep(0.25)
+      local c = contents(P.crafter)
+      if c and next(c) == nil then
+        if tries > 0 then log("info", name .. " started after " .. (tries + 1) .. " pulses") end
+        return true
+      end
+    end
+    if tries >= RETRY_PULSES then return false end
+    tries = tries + 1
+    log("info", name .. " didn't start, pulsing again (" .. tries .. " of " .. RETRY_PULSES .. ")")
+    pulse()
+    activity = "Crafting " .. name .. " (retry " .. tries .. " of " .. RETRY_PULSES .. ")"
+    dirty = true
+  end
+end
+
 -- A craft was running when the computer stopped or errored. Work out what happened.
 local function recoverActive()
   local a = state.active
@@ -626,6 +650,21 @@ local function recoverActive()
     finishCraft(name)
     return
   end
+  if a.filled and next(crafterItems) ~= nil then
+    -- The crafters are still loaded (the base or computer was unloaded mid-craft):
+    -- just pulse again instead of starting over.
+    log("info", "Resuming " .. name .. " craft after a restart")
+    activity = "Resuming " .. name
+    pulse()
+    if waitForStart(name) then
+      finishCraft(name)
+      return
+    end
+    clearCrafters()
+    giveBack(name, a.need)
+    pauseRecipe(name, "Crafters didn't start after " .. (RETRY_PULSES + 1) .. " pulses. Check rotation and the pattern")
+    return
+  end
   if next(crafterItems) ~= nil then clearCrafters() end
   giveBack(name, a.need)
   log("warn", "Interrupted " .. name .. " craft, ingredients returned")
@@ -635,12 +674,21 @@ local failStreak = {}
 
 -- Crafters only accept items while idle, so a refused item means the last
 -- craft is still running. Keep offering the first item until one goes in.
-local function waitForIdle(step)
-  local start = now()
-  while now() - start < CRAFT_TIMEOUT_SECONDS do
-    local ok, n = call(P.input, "pushItems", P.crafter, step.from, 1, step.to)
-    if ok and n == 1 then return true end
-    sleep(0.5)
+-- If they stay busy (often a craft frozen when the base unloaded), pulse to
+-- nudge them, up to RETRY_PULSES times RETRY_SECONDS apart.
+local function waitForIdle(step, name)
+  for attempt = 0, RETRY_PULSES do
+    local start = now()
+    while now() - start < (attempt == 0 and CRAFT_TIMEOUT_SECONDS or RETRY_SECONDS) do
+      local ok, n = call(P.input, "pushItems", P.crafter, step.from, 1, step.to)
+      if ok and n == 1 then return true end
+      sleep(0.5)
+    end
+    if attempt < RETRY_PULSES then
+      log("info", "Crafters still busy, pulsing (" .. (attempt + 1) .. " of " .. RETRY_PULSES .. ")")
+      activity = "Crafters busy, retry " .. (attempt + 1) .. " of " .. RETRY_PULSES
+      pulse()
+    end
   end
   return false
 end
@@ -698,10 +746,10 @@ local function craftOnce(name, r)
   activity = "Crafting " .. name
   dirty = true
 
-  if not waitForIdle(plan[1]) then
+  if not waitForIdle(plan[1], name) then
     clearCrafters()
     giveBack(name, need)
-    pauseRecipe(name, "Crafters stayed busy. Is their output blocked?")
+    pauseRecipe(name, "Crafters stayed busy after " .. RETRY_PULSES .. " retries. Is their output blocked?")
     return false
   end
 
@@ -732,32 +780,15 @@ local function craftOnce(name, r)
 
   pulse()
 
-  -- The crafters empty their slots the moment the craft starts. Keep pulsing
-  -- until they do.
-  local start = now()
-  local lastPulse = now()
-  local pulses = 1
-  while now() - start < GIVE_UP_SECONDS do
-    sleep(0.25)
-    local c = contents(P.crafter)
-    if c and next(c) == nil then
-      failStreak[name] = 0
-      if pulses > 1 then log("info", name .. " started after " .. pulses .. " pulses") end
-      finishCraft(name)
-      return true
-    end
-    if now() - lastPulse >= REPULSE_SECONDS then
-      pulse()
-      lastPulse = now()
-      pulses = pulses + 1
-      activity = "Crafting " .. name .. " (pulse " .. pulses .. ")"
-      dirty = true
-    end
+  if waitForStart(name) then
+    failStreak[name] = 0
+    finishCraft(name)
+    return true
   end
 
   clearCrafters()
   giveBack(name, need)
-  pauseRecipe(name, "Crafters didn't start after " .. GIVE_UP_SECONDS .. "s of pulsing. Check rotation and the pattern")
+  pauseRecipe(name, "Crafters didn't start after " .. (RETRY_PULSES + 1) .. " pulses. Check rotation and the pattern")
   return false
 end
 
