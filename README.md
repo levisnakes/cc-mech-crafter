@@ -50,3 +50,14 @@ Set `DISCORD_WEBHOOK` (and `DISCORD_MENTION`, e.g. `"<@&ROLE_ID>"`) at the top o
 - no gauge data from the Factory Monitor for 2+ minutes (restart the Factory Monitor computer)
 - 2 ingredient orders in a row never arrived (check the station frogport/packager)
 - repeated program errors (restart the crafting computer)
+
+## config.lua
+
+Anything in `/config.lua` on the computer overrides the settings at the top of the program, and survives reinstalls and updates. One file can be shared by every computer; each program ignores settings it doesn't use. Example:
+
+```lua
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/..."
+DISCORD_MENTION = "<@&ROLE_ID>"
+ALLOWED = { "YourName", "Friend" }
+INPUT_CHEST = "minecraft:chest_3"
+```
